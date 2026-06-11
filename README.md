@@ -27,6 +27,6 @@
 ## Gerar gráficos
 
 ```bash
-python3 analysis/plot_snir.py
+python3 analysis/plot_result_network_all.py
 
 ```
