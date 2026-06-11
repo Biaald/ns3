@@ -1,0 +1,638 @@
+/*
+ * Copyright (c) 2017 University of Padova
+ *
+ * SPDX-License-Identifier: GPL-2.0-only
+ *
+ * Author: Davide Magrin <magrinda@dei.unipd.it>
+ */
+
+ /*
+    interferência entre pacotes LoRa;
+    colisão entre SFs;
+    overlap temporal;
+    cálculo de SNIR/SINR;
+    decisão de sucesso ou perda do pacote.
+ */
+#include "lora-interference-helper.h"
+
+#include "ns3/enum.h"
+#include "ns3/log.h"
+
+#include <limits>
+
+namespace ns3
+{
+namespace lorawan
+{
+
+NS_LOG_COMPONENT_DEFINE("LoraInterferenceHelper");
+
+/***************************************
+ *    LoraInterferenceHelper::Event    *
+ ***************************************/
+
+// Event Constructor
+LoraInterferenceHelper::Event::Event(Time duration,
+                                     double rxPowerdBm,
+                                     uint8_t spreadingFactor,
+									 uint8_t irType,
+									 uint16_t nodeId,
+                                     Ptr<Packet> packet,
+                                     double frequencyMHz)
+    : m_startTime(Simulator::Now()),
+      m_endTime(m_startTime + duration),
+      m_sf(spreadingFactor),
+	  m_irType(irType),
+	  m_nodeId(nodeId),
+      m_rxPowerdBm(rxPowerdBm),
+      m_packet(packet),
+      m_frequencyMHz(frequencyMHz)
+{
+    // NS_LOG_FUNCTION_NOARGS ();
+}
+
+// Event Destructor
+LoraInterferenceHelper::Event::~Event()
+{
+    // NS_LOG_FUNCTION_NOARGS ();
+}
+
+// Getters
+Time
+LoraInterferenceHelper::Event::GetStartTime() const
+{
+    return m_startTime;
+}
+
+Time
+LoraInterferenceHelper::Event::GetEndTime() const
+{
+    return m_endTime;
+}
+
+Time
+LoraInterferenceHelper::Event::GetDuration() const
+{
+    return m_endTime - m_startTime;
+}
+
+double
+LoraInterferenceHelper::Event::GetRxPowerdBm() const
+{
+    return m_rxPowerdBm;
+}
+
+uint8_t
+LoraInterferenceHelper::Event::GetSpreadingFactor() const
+{
+    return m_sf;
+}
+
+Ptr<Packet>
+LoraInterferenceHelper::Event::GetPacket() const
+{
+    return m_packet;
+}
+
+double
+LoraInterferenceHelper::Event::GetFrequency() const
+{
+    return m_frequencyMHz;
+}
+
+uint16_t
+LoraInterferenceHelper::Event::GetNodeId (void) const
+{
+  return m_nodeId;
+}
+
+uint8_t
+LoraInterferenceHelper::Event::GetIrType (void) const
+{
+  return m_irType;
+}
+
+void
+LoraInterferenceHelper::SetNumAntennas(uint32_t n)
+{
+    m_numAntennas = n;
+}
+
+uint32_t
+LoraInterferenceHelper::GetNumAntennas() const
+{
+    return m_numAntennas;
+}
+
+void
+LoraInterferenceHelper::SetCombiningMethod(CombiningMethod method)
+{
+    m_combiningMethod = method;
+}
+
+LoraInterferenceHelper::CombiningMethod
+LoraInterferenceHelper::GetCombiningMethod() const
+{
+    return static_cast<CombiningMethod>(m_combiningMethod);
+}
+
+void
+LoraInterferenceHelper::Event::Print(std::ostream& stream) const
+{
+    stream << "(" << m_startTime.GetSeconds() << " s - " << m_endTime.GetSeconds() << " s), SF"
+           << unsigned(m_sf) << ", " << m_rxPowerdBm << " dBm, " << m_frequencyMHz << " MHz";
+}
+
+std::ostream&
+operator<<(std::ostream& os, const LoraInterferenceHelper::Event& event)
+{
+    event.Print(os);
+
+    return os;
+}
+
+/****************************
+ *  LoraInterferenceHelper  *
+ ****************************/
+// This collision matrix can be used for comparisons with the performance of Aloha
+// systems, where collisions imply the loss of both packets.
+double inf = std::numeric_limits<double>::max();
+std::vector<std::vector<double>> LoraInterferenceHelper::collisionSnirAloha = {
+    //   7   8   9  10  11  12
+    {inf, -inf, -inf, -inf, -inf, -inf}, // SF7
+    {-inf, inf, -inf, -inf, -inf, -inf}, // SF8
+    {-inf, -inf, inf, -inf, -inf, -inf}, // SF9
+    {-inf, -inf, -inf, inf, -inf, -inf}, // SF10
+    {-inf, -inf, -inf, -inf, inf, -inf}, // SF11
+    {-inf, -inf, -inf, -inf, -inf, inf}  // SF12
+};
+
+// LoRa Collision Matrix (Goursaud)
+// Values are inverted w.r.t. the paper since here we interpret this as an
+// _isolation_ matrix instead of a cochannel _rejection_ matrix like in
+// Goursaud's paper.
+std::vector<std::vector<double>> LoraInterferenceHelper::collisionSnirGoursaud = {
+    // SF7  SF8  SF9  SF10 SF11 SF12
+    {6, -16, -18, -19, -19, -20}, // SF7
+    {-24, 6, -20, -22, -22, -22}, // SF8
+    {-27, -27, 6, -23, -25, -25}, // SF9
+    {-30, -30, -30, 6, -26, -28}, // SF10
+    {-33, -33, -33, -33, 6, -29}, // SF11
+    {-36, -36, -36, -36, -36, 6}  // SF12
+};
+
+LoraInterferenceHelper::CollisionMatrix LoraInterferenceHelper::collisionMatrix =
+    LoraInterferenceHelper::GOURSAUD;
+
+NS_OBJECT_ENSURE_REGISTERED(LoraInterferenceHelper);
+
+void
+LoraInterferenceHelper::SetCollisionMatrix(
+    enum LoraInterferenceHelper::CollisionMatrix collisionMatrix)
+{
+    switch (collisionMatrix)
+    {
+    case LoraInterferenceHelper::ALOHA:
+        NS_LOG_DEBUG("Setting the ALOHA collision matrix");
+        m_collisionSnir = LoraInterferenceHelper::collisionSnirAloha;
+        break;
+    case LoraInterferenceHelper::GOURSAUD:
+        NS_LOG_DEBUG("Setting the GOURSAUD collision matrix");
+        m_collisionSnir = LoraInterferenceHelper::collisionSnirGoursaud;
+        break;
+    }
+}
+
+TypeId
+LoraInterferenceHelper::GetTypeId()
+{
+    static TypeId tid =
+        TypeId("ns3::LoraInterferenceHelper").SetParent<Object>().SetGroupName("lorawan");
+
+    return tid;
+}
+
+LoraInterferenceHelper::LoraInterferenceHelper()
+    : m_collisionSnir(LoraInterferenceHelper::collisionSnirGoursaud)
+{
+    NS_LOG_FUNCTION(this);
+  	//m_incrementalRed = CHASECOMBINING;
+  	m_incrementalRed = NOREDUNDANCY;
+    SetCollisionMatrix(collisionMatrix);
+}
+
+LoraInterferenceHelper::~LoraInterferenceHelper()
+{
+    NS_LOG_FUNCTION(this);
+}
+
+Time LoraInterferenceHelper::oldEventThreshold = Seconds(2);
+
+Ptr<LoraInterferenceHelper::Event>
+LoraInterferenceHelper::Add(Time duration,
+                            double rxPower,
+                            uint8_t spreadingFactor,
+ 							uint8_t irType,
+							uint16_t nodeId,
+                            Ptr<Packet> packet,
+                            double frequencyMHz)
+{
+    NS_LOG_FUNCTION(this << duration.GetSeconds() << rxPower << unsigned(spreadingFactor) << packet
+                         << frequencyMHz);
+
+    // Create an event based on the parameters
+    Ptr<LoraInterferenceHelper::Event> event =
+        Create<LoraInterferenceHelper::Event>(duration,
+                                              rxPower,
+                                              spreadingFactor,
+									 		  irType,
+									 		  nodeId,
+                                              packet,
+                                              frequencyMHz);
+
+    // Add the event to the list
+    m_events.push_back(event);
+
+    // Clean the event list
+    if (m_events.size() > 100)
+    {
+        CleanOldEvents();
+    }
+
+    return event;
+}
+
+void
+LoraInterferenceHelper::CleanOldEvents()
+{
+    NS_LOG_FUNCTION(this);
+
+    // Cycle the events, and clean up if an event is old.
+    for (auto it = m_events.begin(); it != m_events.end();)
+    {
+        if ((*it)->GetEndTime() + oldEventThreshold < Simulator::Now())
+        {
+            it = m_events.erase(it);
+        }
+        else
+        {
+            it++;
+        }
+    }
+}
+
+std::list<Ptr<LoraInterferenceHelper::Event>>
+LoraInterferenceHelper::GetInterferers()
+{
+    return m_events;
+}
+
+void
+LoraInterferenceHelper::PrintEvents(std::ostream& stream)
+{
+    NS_LOG_FUNCTION_NOARGS();
+
+    stream << "Currently registered events:" << std::endl;
+
+    for (auto it = m_events.begin(); it != m_events.end(); it++)
+    {
+        (*it)->Print(stream);
+        stream << std::endl;
+    }
+}
+
+uint8_t
+LoraInterferenceHelper::IsDestroyedByInterference(Ptr<LoraInterferenceHelper::Event> event)
+{
+    NS_LOG_FUNCTION(this << event);
+
+    NS_LOG_INFO("Current number of events in LoraInterferenceHelper: " << m_events.size());
+
+    // We want to see the interference affecting this event: cycle through events
+    // that overlap with this one and see whether it survives the interference or
+    // not.
+
+    // Gather information about the event
+    double rxPowerDbm = event->GetRxPowerdBm();
+    uint8_t sf = event->GetSpreadingFactor();
+	uint16_t nodeId = event->GetNodeId();
+    double frequency = event->GetFrequency();
+
+    // Handy information about the time frame when the packet was received
+    Time now = Simulator::Now();
+    Time duration = event->GetDuration();
+    Time packetStartTime = now - duration;
+  	Time packetEndTime = now;
+
+    // Get the list of interfering events
+    std::list<Ptr<LoraInterferenceHelper::Event>>::iterator it;
+
+    // Energy for interferers of various SFs
+    std::vector<double> cumulativeInterferenceEnergy(6, 0);
+
+    // Cycle over the events
+    for (it = m_events.begin(); it != m_events.end();)
+    {
+        // Pointer to the current interferer
+        Ptr<LoraInterferenceHelper::Event> interferer = *it;
+
+        // Only consider the current event if the channel is the same: we
+        // assume there's no interchannel interference. Also skip the current
+        // event if it's the same that we want to analyze.
+        if (!(interferer->GetFrequency() == frequency) || interferer == event)
+        {
+            NS_LOG_DEBUG("Different channel or same event");
+            it++;
+            continue; // Continues from the first line inside the for cycle
+        }
+
+        NS_LOG_DEBUG("Interferer on same channel");
+
+        // Gather information about this interferer
+        uint8_t interfererSf = interferer->GetSpreadingFactor();
+        double interfererPower = interferer->GetRxPowerdBm();
+        Time interfererStartTime = interferer->GetStartTime();
+        Time interfererEndTime = interferer->GetEndTime();
+
+        NS_LOG_INFO("Found an interferer: sf = " << unsigned(interfererSf)
+                                                 << ", power = " << interfererPower
+                                                 << ", start time = " << interfererStartTime
+                                                 << ", end time = " << interfererEndTime);
+
+        // Compute the fraction of time the two events are overlapping
+        Time overlap = GetOverlapTime(event, interferer);
+
+        NS_LOG_DEBUG("The two events overlap for " << overlap.GetSeconds() << " s.");
+
+        // Compute the equivalent energy of the interference
+        // Power [mW] = 10^(Power[dBm]/10)
+        // Power [W] = Power [mW] / 1000
+        double interfererPowerW = pow(10, interfererPower / 10) / 1000;
+        // Energy [J] = Time [s] * Power [W]
+        double interferenceEnergy = overlap.GetSeconds() * interfererPowerW;
+        cumulativeInterferenceEnergy.at(unsigned(interfererSf) - 7) += interferenceEnergy;
+        NS_LOG_DEBUG("Interferer power in W: " << interfererPowerW);
+        NS_LOG_DEBUG("Interference energy: " << interferenceEnergy);
+        it++;
+    }
+
+    // For each spreading factor, check if there was destructive interference
+    for (auto currentSf = uint8_t(7); currentSf <= uint8_t(12); currentSf++)
+    {
+        NS_LOG_DEBUG("Cumulative Interference Energy: "
+                     << cumulativeInterferenceEnergy.at(unsigned(currentSf) - 7));
+
+        // Use the computed cumulativeInterferenceEnergy to determine whether the
+        // interference with this spreading factor destroys the packet
+        double signalPowerW = pow(10, rxPowerDbm / 10) / 1000;
+        double signalEnergy = duration.GetSeconds() * signalPowerW;
+        NS_LOG_DEBUG("Signal power in W: " << signalPowerW);
+        NS_LOG_DEBUG("Signal energy: " << signalEnergy);
+
+        // Check whether the packet survives the interference of this spreading factor
+        double snirIsolation = m_collisionSnir[unsigned(sf) - 7][unsigned(currentSf) - 7];
+        NS_LOG_DEBUG("The needed isolation to survive is " << snirIsolation << " dB");
+
+	  	double snir;
+	  	if(event->GetIrType()){
+			snir = signalEnergy / cumulativeInterferenceEnergy.at (unsigned(currentSf) - 7);
+	  		//double snir_p =	10 * log10 (signalEnergy / cumulativeInterferenceEnergy.at (unsigned(currentSf) - 7));
+   		
+			NS_LOG_DEBUG ("The current SNIR_CC is " << snir << " W");
+      	}else{
+            // Cálculo do SINR base (uma antena, sem combining)
+            snir = 10 * log10(signalEnergy / cumulativeInterferenceEnergy.at(unsigned(currentSf) - 7));
+
+            // Soma o ganho de combining da tabela Python
+            double gainDb = GetCombiningGainDb(sf);
+            snir += gainDb;
+
+            NS_LOG_DEBUG("SINR base=" << snir - gainDb
+                        << " dB  ganho=" << gainDb
+                        << " dB  SINR_combined=" << snir << " dB");
+            NS_LOG_UNCOND("SF=" << unsigned(sf)
+                        << " Tech=" << unsigned(m_combiningMethod)
+                        << " Gain=" << gainDb
+                        << " dB  FinalSNIR=" << snir
+);
+      	}
+	  
+
+		//	if (nodeId == 44)
+		//		std::cout << "node: " << nodeId << " SNIR: " << snir << " sign sf: " << unsigned(sf) << " current sf: " << unsigned(currentSf) << std::endl;
+	
+	 	uint8_t id = 0; 
+     	// add incremental redundancy case 
+	  	switch ( event->GetIrType() ) {
+			  case CHASECOMBINING:
+				if(m_chaseCombiningSnir.count(nodeId)>0){
+					if(m_chaseCombiningSnir[nodeId][currentSf - 7].size()>0){
+						m_chaseCombiningSnir[nodeId][currentSf - 7].at(0)+=snir;
+						m_chaseCombiningSnir[nodeId][currentSf - 7].at(1)++;
+						//if (nodeId == 44)
+						//	std::cout << "The SNIRp CH is " << m_chaseCombiningSnir[unsigned(nodeId)][unsigned(currentSf) - 7].at(0) << std::endl;
+					}else{
+						m_chaseCombiningSnir[nodeId][currentSf - 7].resize(2);
+						m_chaseCombiningSnir[nodeId][currentSf - 7].at(0)=snir;
+						m_chaseCombiningSnir[nodeId][currentSf - 7].at(1)=1;
+						//if (nodeId == 44)
+						//	std::cout << "I The SNIRp CH is "<< m_chaseCombiningSnir[unsigned(nodeId)][unsigned(currentSf) - 7].at(0) << std::endl;
+					}
+				}else{
+					m_chaseCombiningSnir[nodeId].resize(6);
+					m_chaseCombiningSnir[nodeId][currentSf - 7].resize(2);
+					m_chaseCombiningSnir[nodeId][currentSf - 7].at(0)=snir;
+					m_chaseCombiningSnir[nodeId][currentSf - 7].at(1)=1;
+					//if (nodeId == 44)
+					//	std::cout << "I The SNIRp CH is " << m_chaseCombiningSnir[unsigned(nodeId)][unsigned(currentSf) - 7].at(0) << std::endl;
+				}
+				snir = m_chaseCombiningSnir[nodeId][currentSf - 7].at(0);
+				id = m_chaseCombiningSnir[nodeId][currentSf - 7].at(1);
+				snir=10*log10(snir);
+				//if (nodeId == 44)
+				//	std::cout << "id: " << unsigned(id) << " The SNIR CH is " << snir << " dB, The SNIR is " << snir_p << " dB" << std::endl;
+  
+ 				NS_LOG_DEBUG( "id: " << (unsigned)id << " The acumulated SNIR_CC is " << snir << " dB");
+		  	  break;
+			  default:
+			  break;
+	  	}	/* -----  end switch  ----- */
+
+
+        if (snir >= snirIsolation)
+        {
+            // Move on and check the rest of the interferers
+            NS_LOG_DEBUG("Packet survived interference with SF " << currentSf);
+        }
+        else
+        {
+            NS_LOG_DEBUG("Packet destroyed by interference with SF" << unsigned(currentSf));
+
+            return currentSf;
+        }
+    }
+    
+
+
+
+	// If we get to here, it means that the packet survived all interference
+    NS_LOG_DEBUG("Packet survived all interference");
+
+    // Since the packet was not destroyed, we return 0.
+    return uint8_t(0);
+}
+
+double
+LoraInterferenceHelper::GetCombiningGainDb(uint8_t sf) const
+{
+    // Ganho independente de SF — os resultados Python foram obtidos
+    // com SF=10 e o ganho de diversidade não varia significativamente
+    // entre SFs para o mesmo canal Rayleigh
+
+    if (m_numAntennas == 1)
+        return 0.0;
+
+    // Tabela de ganhos simulados no Python (Rayleigh, BER @ 10⁻³) 
+    // Índice: m_numAntennas − 1  (L=1→0, L=2→1, ..., L=5→4)
+    static const double gainSC[5]  = { 0.00, 12.58, 16.80, 19.11, 20.45 };
+    static const double gainEGC[5] = { 0.00, 13.47, 18.38, 21.44, 23.08 };
+    static const double gainMRC[5] = { 0.00, 14.16, 19.38, 22.38, 24.28 };
+
+    // Limita L ao máximo da tabela (L=5)
+    uint32_t idx = std::min(m_numAntennas, uint32_t(5)) - 1;
+
+    switch (static_cast<CombiningMethod>(m_combiningMethod))
+    {
+        case SC:    return gainSC[idx];
+        case EGC:   return gainEGC[idx];
+        case MRC:   return gainMRC[idx];
+        default:    return 0.0;   // SINGLE_ANTENNA
+    }
+}
+
+void
+LoraInterferenceHelper::ClearAllEvents()
+{
+    NS_LOG_FUNCTION_NOARGS();
+
+    m_events.clear();
+}
+
+void
+LoraInterferenceHelper::ClearIndexUmap (uint16_t idx)
+{
+  	NS_LOG_FUNCTION_NOARGS ();
+  	if(m_chaseCombiningSnir.count(idx)){
+  		for(uint8_t j=0; j<6; j++){
+  			//std::cout << "j: " << (unsigned)j << " id: " << m_chaseCombiningSnir.count(idx) << " s: " << m_chaseCombiningSnir[idx][j].size() << std::endl;
+  			if(m_chaseCombiningSnir[idx][j].size()){
+				m_chaseCombiningSnir[idx][j].at(0)=0;
+   				m_chaseCombiningSnir[idx][j].at(1)=0;
+			}
+		}
+  	}
+}
+
+uint8_t 
+LoraInterferenceHelper::GetIncrementalRedundancy (void){
+	NS_LOG_FUNCTION_NOARGS();
+
+	return(m_incrementalRed);
+}
+
+Time
+LoraInterferenceHelper::GetOverlapTime(Ptr<LoraInterferenceHelper::Event> event1,
+                                       Ptr<LoraInterferenceHelper::Event> event2)
+{
+    NS_LOG_FUNCTION_NOARGS();
+
+    // Create the value we will return later
+    Time overlap;
+
+    // Get handy values
+    Time s1 = event1->GetStartTime(); // Start times
+    Time s2 = event2->GetStartTime();
+    Time e1 = event1->GetEndTime(); // End times
+    Time e2 = event2->GetEndTime();
+
+    // Non-overlapping events
+    if (e1 <= s2 || e2 <= s1)
+    {
+        overlap = Seconds(0);
+    }
+    // event1 before event2
+    else if (s1 < s2)
+    {
+        if (e2 < e1)
+        {
+            overlap = e2 - s2;
+        }
+        else
+        {
+            overlap = e1 - s2;
+        }
+    }
+    // event2 before event1 or they start at the same time (s1 = s2)
+    else
+    {
+        if (e1 < e2)
+        {
+            overlap = e1 - s1;
+        }
+        else
+        {
+            overlap = e2 - s1;
+        }
+    }
+
+    return overlap;
+}
+} // namespace lorawan
+} // namespace ns3
+
+/*
+  ----------------------------------------------------------------------------
+
+  // Event1 starts before Event2
+  if (s1 < s2)
+  {
+  // Non-overlapping events
+  if (e1 < s2)
+  {
+  overlap = Seconds (0);
+  }
+  // event1 contains event2
+  else if (e1 >= e2)
+  {
+  overlap = e2 - s2;
+  }
+  // Partially overlapping events
+  else
+  {
+  overlap = e1 - s2;
+  }
+  }
+  // Event2 starts before Event1
+  else
+  {
+  // Non-overlapping events
+  if (e2 < s1)
+  {
+  overlap = Seconds (0);
+  }
+  // event2 contains event1
+  else if (e2 >= e1)
+  {
+  overlap = e1 - s1;
+  }
+  // Partially overlapping events
+  else
+  {
+  overlap = e2 - s1;
+  }
+  }
+  return overlap;
+  }
+  }
+  }
+*/
