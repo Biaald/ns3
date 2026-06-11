@@ -16,3 +16,17 @@
 ```bash
 ./ns3 configure
 ./ns3 build
+```
+
+## Executar
+
+```bash
+./ns3 run scratch/lora-simo/lora-network-test
+```
+
+## Gerar gráficos
+
+```bash
+python3 analysis/plot_snir.py
+
+```
