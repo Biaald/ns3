@@ -1,0 +1,484 @@
+/**
+ * Teste completo da rede LoRa com combining de antenas
+ * Topologia:
+ *   30 EDs → 1 Gateway (L antenas, SC/EGC/MRC) → Network Server
+ *
+ * Rodar:
+ *   ./ns3 run "scratch/lora-simo/lora-network-test"
+ *   ./ns3 run "scratch/lora-simo/lora-network-test \
+ *              --nDevices=30 --radius=5000 --simTime=3600 \
+ *              --technique=MRC --nAntennas=4"
+ */
+
+#include "ns3/core-module.h"
+#include "ns3/network-module.h"
+#include "ns3/mobility-module.h"
+#include "ns3/internet-module.h"
+#include "ns3/point-to-point-module.h"
+#include "ns3/log.h"
+
+#include "ns3/lorawan-module.h"
+#include "ns3/lora-helper.h"
+#include "ns3/periodic-sender-helper.h"
+#include "ns3/lora-interference-helper.h"
+#include "ns3/network-server-helper.h"
+#include "ns3/forwarder-helper.h"
+
+#include <vector>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <iostream>
+#include <string>
+#include <chrono>
+
+using namespace ns3;
+using namespace ns3::lorawan;
+
+NS_LOG_COMPONENT_DEFINE("LoraNetworkTest");
+
+// ─── Timer ────────────────────────────────────────────────────────
+using Clock = std::chrono::steady_clock;
+static auto T0 = Clock::now();
+double Elapsed() {
+    return std::chrono::duration<double>(Clock::now() - T0).count();
+}
+
+// ═════════════════════════════════════════════════════════════════
+//  Resultado de uma simulação
+// ═════════════════════════════════════════════════════════════════
+struct SimResult {
+    std::string technique;
+    uint32_t    L;
+    uint32_t    sent;
+    uint32_t    received;
+    double      pdr;
+    double      elapsedSec;
+};
+
+// ═════════════════════════════════════════════════════════════════
+//  Tabela de ganhos do Python (SNR @ BER=10⁻³, Rayleigh, SF=10)
+//  Atualizar com os valores do gain_table.csv após rodar o Python
+// ═════════════════════════════════════════════════════════════════
+double GetPythonGainDb(const std::string& tech, uint32_t L)
+{
+    static const double gSC[5]  = {0.00, 13.58, 17.80, 20.11, 21.45};
+    static const double gEGC[5] = {0.00, 14.47, 19.38, 22.44, 24.08};
+    static const double gMRC[5] = {0.00, 15.16, 20.38, 23.38, 25.28};
+    uint32_t idx = std::min(L, uint32_t(5)) - 1;
+    if (tech == "SC")  return gSC[idx];
+    if (tech == "EGC") return gEGC[idx];
+    if (tech == "MRC") return gMRC[idx];
+    return 0.0;
+}
+
+//  Configura o LoraInterferenceHelper no gateway
+void ConfigureCombining(NodeContainer&     gateways,
+                        const std::string& techniqueName,
+                        uint32_t           numAntennas)
+{
+    for (uint32_t i = 0; i < gateways.GetN(); ++i)
+    {
+        Ptr<Node>          gwNode   = gateways.Get(i);
+        Ptr<NetDevice>     gwNetDev = gwNode->GetDevice(0);
+        Ptr<LoraNetDevice> gwLoraDev =
+            DynamicCast<LoraNetDevice>(gwNetDev);
+
+        if (!gwLoraDev)
+        {
+            NS_LOG_WARN("ConfigureCombining: LoraNetDevice nao encontrado"
+                        " no gateway " << i);
+            continue;
+        }
+
+        Ptr<GatewayLoraPhy> gwPhy =
+            DynamicCast<GatewayLoraPhy>(gwLoraDev->GetPhy());
+
+        if (!gwPhy)
+        {
+            NS_LOG_WARN("ConfigureCombining: GatewayLoraPhy nao encontrado"
+                        " no gateway " << i);
+            continue;
+        }
+
+        LoraInterferenceHelper* helper = gwPhy->GetInterferenceHelper();
+
+        if (!helper)
+        {
+            NS_LOG_WARN("ConfigureCombining: LoraInterferenceHelper nao"
+                        " encontrado no gateway " << i);
+            continue;
+        }
+
+        // Configura matriz de colisão e combining
+        helper->SetCollisionMatrix(LoraInterferenceHelper::GOURSAUD);
+       // helper->SetNumAntennas(numAntennas);
+        helper->SetNumAntennas(std::max(1u, numAntennas));
+        if (techniqueName == "SISO")
+        {
+            helper->SetCombiningMethod(
+                LoraInterferenceHelper::SINGLE_ANTENNA);
+
+            helper->SetNumAntennas(1);
+        }
+        else if (techniqueName == "SC")
+        {
+            helper->SetCombiningMethod(
+                LoraInterferenceHelper::SC);
+
+            helper->SetNumAntennas(numAntennas);
+        }
+        else if (techniqueName == "EGC")
+        {
+            helper->SetCombiningMethod(
+                LoraInterferenceHelper::EGC);
+
+            helper->SetNumAntennas(numAntennas);
+        }
+        else if (techniqueName == "MRC")
+        {
+            helper->SetCombiningMethod(
+                LoraInterferenceHelper::MRC);
+
+            helper->SetNumAntennas(numAntennas);
+        }
+
+       /* if      (techniqueName == "SC")
+            helper->SetCombiningMethod(LoraInterferenceHelper::SC);
+        else if (techniqueName == "EGC")
+            helper->SetCombiningMethod(LoraInterferenceHelper::EGC);
+        else if (techniqueName == "MRC")
+            helper->SetCombiningMethod(LoraInterferenceHelper::MRC);
+        else
+            helper->SetCombiningMethod(LoraInterferenceHelper::SINGLE_ANTENNA);*/
+
+        NS_LOG_INFO("GW[" << i << "] combining="
+                    << techniqueName << " L=" << numAntennas);
+    }
+}
+
+//  Roda uma simulação completa
+SimResult RunSimulation(
+    uint32_t    nDevices,
+    double      radius,
+    double      simTime,
+    double      pkgIntervalSec,
+    std::string techniqueName,
+    uint32_t    numAntennas,
+    uint32_t    seed)
+{
+    RngSeedManager::SetSeed(seed);
+    RngSeedManager::SetRun(1);
+
+    auto tStart = Clock::now();
+
+    // ── 1. Canal ──────────────────────────────────────────────────
+    Ptr<LogDistancePropagationLossModel> loss =
+        CreateObject<LogDistancePropagationLossModel>();
+    loss->SetPathLossExponent(3.76);
+    loss->SetReference(1.0, 7.7);
+
+    Ptr<ConstantSpeedPropagationDelayModel> delay =
+        CreateObject<ConstantSpeedPropagationDelayModel>();
+
+    Ptr<LoraChannel> channel =
+        CreateObject<LoraChannel>(loss, delay);
+
+    // ── 2. Helpers LoRa ───────────────────────────────────────────
+    LoraPhyHelper    phyHelper;
+    LorawanMacHelper macHelper;
+    LoraHelper       loraHelper;
+
+    phyHelper.SetChannel(channel);
+    loraHelper.EnablePacketTracking();
+
+    // ── 3. End Devices ────────────────────────────────────────────
+    NodeContainer endDevices;
+    endDevices.Create(nDevices);
+
+    MobilityHelper edMob;
+    edMob.SetPositionAllocator(
+        "ns3::UniformDiscPositionAllocator",
+        "X",   DoubleValue(0.0),
+        "Y",   DoubleValue(0.0),
+        "rho", DoubleValue(radius));
+    edMob.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+    edMob.Install(endDevices);
+
+    phyHelper.SetDeviceType(LoraPhyHelper::ED);
+    macHelper.SetDeviceType(LorawanMacHelper::ED_A);
+    loraHelper.Install(phyHelper, macHelper, endDevices);
+
+    // ── 4. Gateway ────────────────────────────────────────────────
+    NodeContainer gateways;
+    gateways.Create(1);
+
+    Ptr<ListPositionAllocator> gwPos =
+        CreateObject<ListPositionAllocator>();
+    gwPos->Add(Vector(0.0, 0.0, 15.0));
+
+    MobilityHelper gwMob;
+    gwMob.SetPositionAllocator(gwPos);
+    gwMob.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+    gwMob.Install(gateways);
+
+    phyHelper.SetDeviceType(LoraPhyHelper::GW);
+    macHelper.SetDeviceType(LorawanMacHelper::GW);
+    loraHelper.Install(phyHelper, macHelper, gateways);
+
+    // ── 5. Configura combining ANTES de instalar o servidor ───────
+    // Importante: feito aqui, após criar a PHY do GW mas antes
+    // de instalar o NetworkServer, para garantir que o helper
+    // já está configurado quando os primeiros pacotes chegarem
+    ConfigureCombining(gateways, techniqueName, numAntennas);
+
+    // ── 6. SF automático por distância ────────────────────────────
+    macHelper.SetSpreadingFactorsUp(endDevices, gateways, channel);
+
+    // ── 7. Rede IP entre Gateway e Network Server (P2P) ───────────
+    NodeContainer networkServer;
+    networkServer.Create(1);
+
+    // Internet stack SOMENTE no network server
+    // O gateway LoRa tem sua própria pilha interna
+    InternetStackHelper internet;
+    internet.Install(gateways);
+    internet.Install(networkServer);
+
+    PointToPointHelper p2p;
+    p2p.SetDeviceAttribute("DataRate", StringValue("5Mbps"));
+    p2p.SetChannelAttribute("Delay",   StringValue("2ms"));
+
+    Ipv4AddressHelper ipv4;
+    ipv4.SetBase("10.1.1.0", "255.255.255.0");
+
+    // Registro P2P: (dispositivo no NS, nó gateway)
+    P2PGwRegistration_t gwRegistration;
+
+    for (uint32_t i = 0; i < gateways.GetN(); ++i)
+    {
+        NodeContainer pair(gateways.Get(i), networkServer.Get(0));
+        NetDeviceContainer devs = p2p.Install(pair);
+        ipv4.Assign(devs);
+        ipv4.NewNetwork();   // próximo gateway em subnet diferente
+
+        Ptr<PointToPointNetDevice> nsDevice =
+            DynamicCast<PointToPointNetDevice>(devs.Get(1));
+
+        gwRegistration.push_back(
+            std::make_pair(nsDevice, gateways.Get(i)));
+    }
+
+    // ── 8. Network Server ─────────────────────────────────────────
+    // Ordem correta: SetGateways → SetEndDevices → Install
+    NetworkServerHelper nsHelper;
+    nsHelper.SetGatewaysP2P(gwRegistration);
+    nsHelper.SetEndDevices(endDevices);
+    nsHelper.Install(networkServer.Get(0));
+
+    // ── 9. Forwarder no gateway ───────────────────────────────────
+    // Deve ser instalado APÓS o NetworkServer
+    ForwarderHelper forwarderHelper;
+    forwarderHelper.Install(gateways);
+
+    // ── 10. Tráfego periódico ─────────────────────────────────────
+    PeriodicSenderHelper senderHelper;
+    senderHelper.SetPeriod(Seconds(pkgIntervalSec));
+    senderHelper.SetPacketSize(20);
+
+    ApplicationContainer apps = senderHelper.Install(endDevices);
+    apps.Start(Seconds(0.0));
+    apps.Stop(Seconds(simTime));
+
+    // ── 11. Simulação ─────────────────────────────────────────────
+    Simulator::Stop(Seconds(simTime + 10.0));
+    Simulator::Run();    // ← chamado UMA única vez
+
+    // ── 12. Métricas ─────────────────────────────────────────────
+    // Leitura ANTES do Destroy — tracker é destruído junto com o simulador
+    LoraPacketTracker& tracker =
+        loraHelper.GetPacketTracker();
+
+    std::string stats =
+        tracker.CountMacPacketsGlobally(
+            Seconds(0),
+            Seconds(simTime));
+
+    std::cout << "\n=== TRACKER RAW ===\n"
+            << stats << std::endl;
+
+    // Parse robusto
+    uint32_t sent = 0;
+    uint32_t received = 0;
+    uint32_t interfered = 0;
+    uint32_t noReceiver = 0;
+
+    std::istringstream iss(stats);
+
+    iss >> sent
+        >> received
+        >> interfered
+        >> noReceiver;
+
+    std::cout
+        << "Sent=" << sent
+        << " Received=" << received
+        << " Interfered=" << interfered
+        << " NoReceiver=" << noReceiver
+        << std::endl;
+    // ── 13. Destroy ───────────────────────────────────────────────
+    // Chamado APÓS coletar as métricas
+    Simulator::Destroy();
+
+    double elapsed = std::chrono::duration<double>(
+        Clock::now() - tStart).count();
+
+    SimResult res;
+    res.technique  = techniqueName;
+    res.L          = numAntennas;
+    res.sent       = sent;
+    res.received   = received;
+    res.pdr        = (sent > 0)
+                     ? static_cast<double>(received) / sent
+                     : 0.0;
+    res.elapsedSec = elapsed;
+    return res;
+}
+
+// ═════════════════════════════════════════════════════════════════
+//  main
+// ═════════════════════════════════════════════════════════════════
+int main(int argc, char* argv[])
+{
+    uint32_t    nDevices       = 30;
+    double      radius         = 5000.0;
+    double      simTime        = 3600.0;
+    double      pkgIntervalSec = 3600.0;
+    std::string technique      = "ALL";
+    uint32_t    nAntennas      = 0;
+    uint32_t    seed           = 42;
+
+    CommandLine cmd(__FILE__);
+    cmd.AddValue("nDevices",  "Numero de end devices",          nDevices);
+    cmd.AddValue("radius",    "Raio da celula (m)",              radius);
+    cmd.AddValue("simTime",   "Tempo de simulacao (s)",          simTime);
+    cmd.AddValue("interval",  "Intervalo entre pacotes (s)",     pkgIntervalSec);
+    cmd.AddValue("technique", "ALL / SISO / SC / EGC / MRC",    technique);
+    cmd.AddValue("nAntennas", "Num antenas (0=todos 1..5)",      nAntennas);
+    cmd.AddValue("seed",      "Semente RNG",                     seed);
+    cmd.Parse(argc, argv);
+
+    LogComponentEnable("LoraNetworkTest", LOG_LEVEL_INFO);
+
+    NS_LOG_INFO("=== Rede LoRa com Combining ===");
+    NS_LOG_INFO("nDevices="   << nDevices
+                << "  radius=" << radius   << " m"
+                << "  simTime="<< simTime  << " s"
+                << "  interval="<< pkgIntervalSec << " s");
+
+    // ── Lista de rodadas ──────────────────────────────────────────
+    std::vector<std::string> techs;
+    if (technique == "ALL" || technique == "SISO") techs.push_back("SISO");
+    if (technique == "ALL" || technique == "SC")   techs.push_back("SC");
+    if (technique == "ALL" || technique == "EGC")  techs.push_back("EGC");
+    if (technique == "ALL" || technique == "MRC")  techs.push_back("MRC");
+
+    std::vector<uint32_t> antList =
+        (nAntennas == 0)
+        ? std::vector<uint32_t>{1, 2, 3, 4, 5}
+        : std::vector<uint32_t>{nAntennas};
+
+    // ── CSV de saída ──────────────────────────────────────────────
+    std::ofstream csv("lora_network_pdr.csv");
+    csv << "technique,L,sent,received,PDR,gain_python_dB,elapsed_s\n";
+
+    // ── Cabeçalho do terminal ─────────────────────────────────────
+    std::cout << "\n"
+              << std::left  << std::setw(8)  << "Tecnica"
+              << std::right << std::setw(4)  << "L"
+              << std::setw(8)  << "Sent"
+              << std::setw(8)  << "Recv"
+              << std::setw(8)  << "PDR"
+              << std::setw(16) << "Ganho_Py(dB)"
+              << std::setw(10) << "Tempo(s)"
+              << "\n" << std::string(62, '-') << "\n";
+
+    std::vector<SimResult> results;
+    double pdrSiso = -1.0;
+
+    for (auto& tech : techs)
+    {
+        auto list = (tech == "SISO")
+                    ? std::vector<uint32_t>{1}
+                    : antList;
+
+        for (uint32_t L : list)
+        {
+            std::cout << "  Rodando " << tech
+                      << " L=" << L << " ..." << std::flush;
+
+            SimResult r = RunSimulation(
+                nDevices, radius, simTime, pkgIntervalSec,
+                tech, L, seed);
+
+            results.push_back(r);
+
+            if (tech == "SISO" && L == 1)
+                pdrSiso = r.pdr;
+
+            double gainDb = GetPythonGainDb(tech, L);
+
+            csv << r.technique << "," << r.L      << ","
+                << r.sent      << "," << r.received << ","
+                << std::fixed << std::setprecision(4) << r.pdr    << ","
+                << gainDb      << ","
+                << std::setprecision(1) << r.elapsedSec << "\n";
+            csv.flush();
+
+            std::cout << "\r"
+                      << std::left  << std::setw(8)  << r.technique
+                      << std::right << std::setw(4)  << r.L
+                      << std::setw(8)  << r.sent
+                      << std::setw(8)  << r.received
+                      << std::setw(8)  << std::fixed
+                      << std::setprecision(3) << r.pdr
+                      << std::setw(16) << std::setprecision(2) << gainDb
+                      << std::setw(10) << std::setprecision(1) << r.elapsedSec
+                      << "\n";
+        }
+    }
+
+    csv.close();
+
+    // ── Tabela de ganho de PDR vs SISO ────────────────────────────
+    if (pdrSiso > 0.0)
+    {
+        std::cout << "\n=== Ganho vs SISO L=1 ===\n"
+                  << std::left  << std::setw(8)  << "Tecnica"
+                  << std::right << std::setw(4)  << "L"
+                  << std::setw(10) << "PDR"
+                  << std::setw(12) << "Melhora"
+                  << std::setw(16) << "Ganho_Py(dB)"
+                  << "\n" << std::string(50, '-') << "\n";
+
+        for (auto& r : results)
+        {
+            if (r.technique == "SISO") continue;
+            double melhora = (r.pdr - pdrSiso) * 100.0;
+            double gainDb  = GetPythonGainDb(r.technique, r.L);
+            std::cout << std::left  << std::setw(8)  << r.technique
+                      << std::right << std::setw(4)  << r.L
+                      << std::setw(10) << std::fixed
+                      << std::setprecision(3) << r.pdr
+                      << std::setw(11) << std::setprecision(1)
+                      << melhora << "%"
+                      << std::setw(15) << std::setprecision(2)
+                      << gainDb << " dB\n";
+        }
+    }
+
+    std::cout << "\nTempo total: " << std::fixed
+              << std::setprecision(1) << Elapsed() << " s\n"
+              << "✅ lora_network_pdr.csv\n";
+    return 0;
+}
