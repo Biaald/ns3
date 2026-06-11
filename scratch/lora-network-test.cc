@@ -7,16 +7,11 @@
  * Adicionado: configuração de SC/EGC/MRC no LoraInterferenceHelper
  *
  * Rodar:
- *   ./ns3 run "scratch/lora-simo/lora-network-test"
- *   ./ns3 run "scratch/lora-simo/lora-network-test \
- *              --nDevices=30 --radius=5000 --simTime=3600 \
- *              --technique=MRC --nAntennas=4 --realisticChannelModel=true"
- * 
- * ./ns3 run "scratch/lora-simo/lora-network-test \
-    --nDevices=500 \
-    --radius=2000 \
+  ./ns3 run "scratch/lora-simo/lora-network-test \
+    --nDevices=600 \
+    --radius=2500 \
     --simTime=3600 \
-    --appPeriod=10 \
+    --appPeriod=50 \
     --technique=ALL \
     --nAntennas=0 \
     --realisticChannel=true"
@@ -444,14 +439,14 @@ SimResult RunSimulation(
 
 int main(int argc, char* argv[])
 {
-    int         nDevices       = 30;
-    double      radius         = 5000.0;
+    int         nDevices       = 600;
+    double      radius         = 2500.0;
     double      simTime        = 3600.0;
-    int         appPeriod      = 600;    // 1 pacote a cada 600s por ED
+    int         appPeriod      = 50;    // 1 pacote a cada 600s por ED
     std::string technique      = "ALL";
     uint32_t    nAntennas      = 0;      // 0 = testa 1..5
     uint32_t    seed           = 1;
-    bool realisticChannelModel = false; //!< Whether to use a more realistic channel model with
+    bool realisticChannelModel = true; //!< Whether to use a more realistic channel model with
                                     //!< Buildings and correlated shadowing
 
     CommandLine cmd(__FILE__);
