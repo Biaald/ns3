@@ -21,7 +21,7 @@
 ## Executar
 
 ```bash
-./ns3 run scratch/lora-simo/lora-network-test
+./ns3 run lora-network-test
 ```
 
 ## Gerar gráficos
